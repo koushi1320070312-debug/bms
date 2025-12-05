@@ -1,35 +1,78 @@
 #include <iostream>
-#include <SDL.h> // SDL2のコアライブラリをインクルード
+#include <vector>
+#include <algorithm> // std::find_if, std::abs
+#include <SDL.h>     // SDL2のコアライブラリをインクルード
 
 // =========================================================
-// 移植性の高いゲームコア構造 (C++ サンプル - SDL2実装)
+// 移植性の高いゲームコア構造 (C++ サンプル - リズムゲーム実装)
 // 
-// SDL2を使用して、ウィンドウ、入力、描画の抽象化レイヤーを
-// 実際に実装しています。Update内のゲームロジックは
-// プラットフォーム非依存のままです。
+// リズムゲームの核となるデータ構造と時間管理、描画ロジックを
+// SDL2のフレームワークに組み込みました。
 // =========================================================
 
 // ゲームの基本設定
 constexpr int SCREEN_WIDTH = 1280;
 constexpr int SCREEN_HEIGHT = 720;
 constexpr int TARGET_FPS = 60;
-constexpr Uint32 FRAME_TIME_MS = 1000 / TARGET_FPS; // SDLではUint32を使用
+constexpr Uint32 FRAME_TIME_MS = 1000 / TARGET_FPS; 
+
+// リズムゲームの描画設定
+constexpr int LANE_COUNT = 4;
+constexpr int LANE_WIDTH = 150;
+constexpr int LANE_START_X = (SCREEN_WIDTH - (LANE_COUNT * LANE_WIDTH)) / 2;
+constexpr int HIT_LINE_Y = 650; // ノートを叩く判定ラインのY座標
+constexpr float NOTE_HEIGHT = 20.0f;
+constexpr float SCROLL_SPEED = 500.0f; // 1秒あたりのピクセル移動量
 
 // SDL2固有のグローバルオブジェクト
 SDL_Window* g_window = nullptr;
 SDL_Renderer* g_renderer = nullptr;
 
+/**
+ * @brief 音楽ノート/イベントの構造体
+ * time_seconds: 音楽開始からの時間（秒）。この時間に判定ラインに到達する
+ * lane: どのレーンに出現するか (0からLANE_COUNT-1)
+ * hit: 既に判定されたか
+ */
+struct NoteEvent {
+    float time_seconds;
+    int lane;
+    bool hit = false;
+};
+
 // プレイヤーの位置や状態を表す構造体
 struct GameState {
-    float player_x = SCREEN_WIDTH / 2.0f;
-    float player_y = SCREEN_HEIGHT / 2.0f;
-    float speed = 200.0f; // 1秒あたりのピクセル移動量に変更 (Update関数でdelta_timeを使うため)
+    // リズムゲームコア
+    std::vector<NoteEvent> chart_data; // ノートデータの配列 (本来はBMSからロード)
+    float game_time = 0.0f;            // 音楽開始からの経過時間（秒）
+    
+    // スコアリング
     int score = 0;
+    int combo = 0;
+    
     bool running = true; // メインループの実行状態
 };
 
 // ゲームの状態
 GameState state;
+
+/**
+ * @brief ノートの当たり判定の許容範囲 (秒)
+ */
+constexpr float JUDGEMENT_WINDOW = 0.15f; // ±150ms
+
+/**
+ * @brief ダミーのノートデータを作成 (本来はBMSファイルをパースする)
+ */
+void CreateDummyChart() {
+    // 0.5秒ごとにノートを配置
+    for (int i = 0; i < 20; ++i) {
+        float time = 1.0f + i * 0.5f; // 1秒後からスタート
+        int lane = i % LANE_COUNT;
+        state.chart_data.push_back({time, lane});
+    }
+    std::cout << "Dummy chart with " << state.chart_data.size() << " notes created." << std::endl;
+}
 
 /**
  * @brief ゲームの初期化処理 (SDL2固有の実装)
@@ -47,7 +90,7 @@ bool Initialize() {
 
     // 2. ウィンドウの作成
     g_window = SDL_CreateWindow(
-        "Portable SDL2 Game Core",
+        "Portable SDL2 Rhythm Game Core",
         SDL_WINDOWPOS_UNDEFINED,
         SDL_WINDOWPOS_UNDEFINED,
         SCREEN_WIDTH,
@@ -59,127 +102,173 @@ bool Initialize() {
         return false;
     }
 
-    // 3. レンダラーの作成 (ハードウェアアクセラレーションを使用)
+    // 3. レンダラーの作成
     g_renderer = SDL_CreateRenderer(
         g_window,
         -1,
-        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC // VSyncを有効にしてFPSをディスプレイに合わせる
+        SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC
     );
     if (g_renderer == nullptr) {
         std::cerr << "Renderer could not be created! SDL Error: " << SDL_GetError() << std::endl;
         return false;
     }
     
-    // 描画色を黒に設定
-    SDL_SetRenderDrawColor(g_renderer, 0x00, 0x00, 0x00, 0xFF);
-
-    std::cout << "Screen: " << SCREEN_WIDTH << "x" << SCREEN_HEIGHT << std::endl;
-    std::cout << "Assets loaded." << std::endl;
+    // ダミーチャートの作成
+    CreateDummyChart();
+    
     std::cout << "Initialization successful." << std::endl;
     return true;
 }
 
 /**
  * @brief 入力処理 (SDL2固有の実装)
- * * キーボード、コントローラーの入力を処理し、状態を更新します。
+ * * キーボード（レーンに対応）の入力を処理し、状態を更新します。
  */
 void HandleInput() {
     SDL_Event e;
-    // イベントキューにあるすべてのイベントを処理
     while (SDL_PollEvent(&e) != 0) {
-        // ウィンドウを閉じるイベント
         if (e.type == SDL_QUIT) {
             state.running = false;
         }
         
-        // キーボードのキーダウンイベント
         if (e.type == SDL_KEYDOWN) {
+            if (e.key.keysym.sym == SDLK_ESCAPE) {
+                state.running = false;
+            }
+            
+            // レーン判定用のキーマップ (移植時はJoy-Con/Vitaボタンに置き換え)
+            int pressed_lane = -1;
             switch (e.key.keysym.sym) {
-                case SDLK_ESCAPE:
-                    state.running = false;
-                    break;
-                // 他のキー入力はUpdate関数内で処理するためここでは省略
+                case SDLK_f: pressed_lane = 0; break; // Lane 1
+                case SDLK_g: pressed_lane = 1; break; // Lane 2
+                case SDLK_h: pressed_lane = 2; break; // Lane 3
+                case SDLK_j: pressed_lane = 3; break; // Lane 4
+            }
+
+            if (pressed_lane != -1) {
+                // 押されたレーンに未判定のノートがあるかチェック
+                auto it = std::find_if(
+                    state.chart_data.begin(),
+                    state.chart_data.end(),
+                    [&](const NoteEvent& note) {
+                        return !note.hit && note.lane == pressed_lane;
+                    }
+                );
+
+                if (it != state.chart_data.end()) {
+                    float time_diff = std::abs(it->time_seconds - state.game_time);
+
+                    if (time_diff <= JUDGEMENT_WINDOW) {
+                        // 判定成功: Good, Perfectなどのロジックを追加可能
+                        std::cout << "Hit! Lane: " << pressed_lane << ", Diff: " << time_diff * 1000.0f << "ms" << std::endl;
+                        it->hit = true;
+                        state.score += 100;
+                        state.combo++;
+                    } else if (it->time_seconds < state.game_time - JUDGEMENT_WINDOW) {
+                        // タイミングが遅すぎたが、判定期間外のため見逃す (Miss判定はUpdateで処理)
+                    }
+                }
             }
         }
     }
-    
-    // 現在のキーボードの状態を取得 (同時押し対応)
-    const Uint8* current_keys = SDL_GetKeyboardState(NULL);
-
-    // W, A, S, D または矢印キーによるプレイヤーの移動処理
-    // 移動処理はロジック層(Update)で行うため、ここでは入力フラグを立てるなどの処理が理想ですが、
-    // シンプルにするためここではロジックを直接更新しています。
-    // Updateでdelta_timeを使うため、ここではロジックを更新しません。Updateで処理します。
 }
 
 /**
  * @brief ゲームロジックの更新
- * * 物理演算、衝突判定、AI、スコア更新などのロジックをフレームレートに合わせて実行します。
- * この関数内のコードは、プラットフォームに依存しない純粋なC++ロジックとして設計します。
+ * * 時間の進行、ミス判定（見逃し）、スコア更新などのロジックを実行します。
  * * @param delta_time 前フレームからの経過時間（秒）
  */
 void Update(float delta_time) {
-    // スコアの更新 (デモとして)
-    state.score = (int)SDL_GetTicks() / 100; // 経過時間でスコアが増加
+    // 1. ゲーム時間の進行 (ロジックの核)
+    state.game_time += delta_time; 
 
-    const Uint8* current_keys = SDL_GetKeyboardState(NULL);
-    float move_distance = state.speed * delta_time; // デルタタイムを使って移動距離を計算
+    // 2. ミス判定（判定ラインを通り過ぎたノートの処理）
+    for (auto& note : state.chart_data) {
+        if (!note.hit) {
+            // ノートの時間 - 判定時間窓 < 現在のゲーム時間 
+            // つまり、判定ラインを通り過ぎてしまった場合
+            if (note.time_seconds < state.game_time - JUDGEMENT_WINDOW) {
+                std::cout << "Miss! Lane: " << note.lane << std::endl;
+                note.hit = true; // 判定済みにする
+                state.combo = 0; // コンボリセット
+                // スコア減点などの処理をここに追加
+            }
+        }
+    }
+    
+    // 3. ゲーム終了判定 (全てのノートが判定されたか)
+    bool all_notes_processed = std::all_of(
+        state.chart_data.begin(),
+        state.chart_data.end(),
+        [](const NoteEvent& note){ return note.hit; }
+    );
 
-    // W, A, S, D または矢印キーによるプレイヤーの移動
-    if (current_keys[SDL_SCANCODE_W] || current_keys[SDL_SCANCODE_UP]) {
-        state.player_y -= move_distance;
+    if (all_notes_processed && state.game_time > 5.0f) { // 最後に数秒待機
+        // state.running = false; // デモでは自動終了させない
     }
-    if (current_keys[SDL_SCANCODE_S] || current_keys[SDL_SCANCODE_DOWN]) {
-        state.player_y += move_distance;
-    }
-    if (current_keys[SDL_SCANCODE_A] || current_keys[SDL_SCANCODE_LEFT]) {
-        state.player_x -= move_distance;
-    }
-    if (current_keys[SDL_SCANCODE_D] || current_keys[SDL_SCANCODE_RIGHT]) {
-        state.player_x += move_distance;
-    }
-
-
-    // プレイヤーの位置を画面内に制限
-    if (state.player_x < 25) state.player_x = 25; // 描画サイズを考慮
-    if (state.player_x > SCREEN_WIDTH - 25) state.player_x = SCREEN_WIDTH - 25;
-    if (state.player_y < 25) state.player_y = 25;
-    if (state.player_y > SCREEN_HEIGHT - 25) state.player_y = SCREEN_HEIGHT - 25;
 }
 
 /**
  * @brief 描画処理 (SDL2固有の実装)
- * * ゲーム画面にオブジェクトを描画します。
+ * * レーン、判定ライン、スクロールするノートを描画します。
  */
 void Render() {
     // 1. 描画バッファのクリア（背景色で塗りつぶし）
-    SDL_SetRenderDrawColor(g_renderer, 0x00, 0x00, 0x00, 0xFF); // 黒に設定
+    SDL_SetRenderDrawColor(g_renderer, 0x1A, 0x1A, 0x1A, 0xFF); // 暗い背景
     SDL_RenderClear(g_renderer);
+    
+    // --- 2. レーンと判定ラインの描画 ---
+    
+    // 判定ライン (青色のライン)
+    SDL_SetRenderDrawColor(g_renderer, 0x00, 0xAA, 0xFF, 0xFF);
+    SDL_RenderDrawLine(g_renderer, 
+                       LANE_START_X, HIT_LINE_Y, 
+                       LANE_START_X + LANE_COUNT * LANE_WIDTH, HIT_LINE_Y);
 
-    // 2. 描画コマンド
+    // レーンの描画
+    SDL_SetRenderDrawColor(g_renderer, 0x33, 0x33, 0x33, 0xFF); // レーンの境界線
+    for (int i = 0; i <= LANE_COUNT; ++i) {
+        int x = LANE_START_X + i * LANE_WIDTH;
+        SDL_RenderDrawLine(g_renderer, x, 0, x, SCREEN_HEIGHT);
+    }
+
+    // --- 3. ノートの描画 ---
+    SDL_SetRenderDrawColor(g_renderer, 0xFF, 0xFF, 0x00, 0xFF); // ノートの色 (黄色)
+    for (const auto& note : state.chart_data) {
+        if (note.hit) continue; // 既に判定済みのノートは描画しない
+
+        // 判定ラインからの距離 (ピクセル)
+        float distance = (note.time_seconds - state.game_time) * SCROLL_SPEED;
+        
+        // 画面上でのY座標を計算
+        float note_y = HIT_LINE_Y - distance; 
+        
+        // ノートが画面内にある場合のみ描画
+        if (note_y > 0 && note_y < SCREEN_HEIGHT + NOTE_HEIGHT) {
+            SDL_Rect note_rect = {
+                LANE_START_X + note.lane * LANE_WIDTH + 5,  // レーン内の左端 + 少し隙間
+                (int)(note_y - NOTE_HEIGHT / 2.0f),
+                LANE_WIDTH - 10,
+                (int)NOTE_HEIGHT
+            };
+            SDL_RenderFillRect(g_renderer, &note_rect);
+        }
+    }
     
-    // プレイヤーを描画 (赤色の正方形)
-    SDL_Rect player_rect = { 
-        (int)(state.player_x - 25), 
-        (int)(state.player_y - 25), 
-        50, 
-        50 
-    };
-    SDL_SetRenderDrawColor(g_renderer, 0xFF, 0x00, 0x00, 0xFF); // 赤色に設定
-    SDL_RenderFillRect(g_renderer, &player_rect);
-    
-    // 3. 描画バッファのフリップ（画面表示）
+    // 4. スコア表示 (簡易的にコンソールに出力、本来はSDL_ttfで描画)
+    std::cout << "\rTime: " << state.game_time << "s | Score: " << state.score << " | Combo: " << state.combo << " | FPS: " << 1.0f / (SDL_GetTicks() - SDL_GetTicks()) * 1000.0f << " (Approx)";
+    std::cout.flush();
+
+    // 5. 描画バッファのフリップ（画面表示）
     SDL_RenderPresent(g_renderer);
 }
 
 /**
  * @brief 終了処理 (SDL2固有の実装)
- * * 初期化で確保したリソースの解放や、ライブラリ/SDKの終了処理を行います。
  */
 void Cleanup() {
-    std::cout << "--- Game Cleanup ---" << std::endl;
+    std::cout << "\n--- Game Cleanup ---" << std::endl;
     
-    // 1. SDLリソースの破棄
     if (g_renderer) {
         SDL_DestroyRenderer(g_renderer);
         g_renderer = nullptr;
@@ -189,7 +278,6 @@ void Cleanup() {
         g_window = nullptr;
     }
     
-    // 2. SDL2の終了
     SDL_Quit();
     
     std::cout << "Resources released. Goodbye." << std::endl;
@@ -198,26 +286,22 @@ void Cleanup() {
 /**
  * @brief メイン関数とゲームループ
  */
-int main(int argc, char* args[]) { // SDLのmain関数形式に合わせる
-    // フレーム時間計測のための変数
+int main(int argc, char* args[]) {
     Uint32 last_time = 0;
     
-    // 1. 初期化
     if (!Initialize()) {
         Cleanup();
         return 1;
     }
 
-    // 初期化後、最初の時刻を取得
     last_time = SDL_GetTicks();
 
     std::cout << "\n--- Game Loop Start ---" << std::endl;
 
-    // 2. ゲームループ
     while (state.running) {
         Uint32 frame_start_time = SDL_GetTicks();
         
-        // デルタタイム (前フレームからの経過時間。Update関数に渡すために秒に変換)
+        // デルタタイム (前フレームからの経過時間。秒に変換)
         Uint32 current_time = SDL_GetTicks();
         float delta_time = (current_time - last_time) / 1000.0f;
         last_time = current_time;
@@ -226,13 +310,12 @@ int main(int argc, char* args[]) { // SDLのmain関数形式に合わせる
         HandleInput();
 
         // b. 更新処理 (ゲームロジック)
-        // delta_time (秒) を使用することで、フレームレートに依存しない移動を実現
         Update(delta_time);
 
         // c. 描画処理
         Render();
         
-        // d. フレームレート制御 (TARGET_FPSに合わせて待機)
+        // d. フレームレート制御
         Uint32 frame_duration_ms = SDL_GetTicks() - frame_start_time;
 
         if (frame_duration_ms < FRAME_TIME_MS) {
@@ -242,7 +325,6 @@ int main(int argc, char* args[]) { // SDLのmain関数形式に合わせる
 
     std::cout << "--- Game Loop End ---" << std::endl;
 
-    // 3. 終了処理
     Cleanup();
 
     return 0;
