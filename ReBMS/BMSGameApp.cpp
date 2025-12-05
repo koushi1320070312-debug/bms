@@ -1,119 +1,95 @@
 #include "BMSGameApp.h"
+#include <emscripten/bind.h>
+#include <memory>
 #include <iostream>
-#include <algorithm>
-#include <stdexcept>
-#include <iomanip>
 
-// --------------------------------------------------------
-// コンストラクタ
-// --------------------------------------------------------
-BMSGameApp::BMSGameApp()
-{
-    // 初期化時、playerはnullのままにしておく
-    // LoadBMSが呼ばれたときに初期化する
-    std::cout << "BMSGameApp Initialized. Awaiting BMS data loading." << std::endl;
+// グローバルなBMSGameAppインスタンス
+// JavaScriptからアクセスできるようにする
+std::unique_ptr<BMSGameApp> g_app = nullptr;
+
+/**
+ * ゲームアプリケーションの初期化
+ * JavaScriptから最初に呼び出される
+ */
+BMSGameApp* initialize_app() {
+    // 既に初期化されていれば既存のインスタンスを返す
+    if (!g_app) {
+        g_app = std::make_unique<BMSGameApp>();
+    }
+    std::cout << "BMSGameApp instance created and ready." << std::endl;
+    return g_app.get();
 }
 
-// --------------------------------------------------------
-// BMSデータロード
-// --------------------------------------------------------
-void BMSGameApp::LoadBMS(
-    const std::vector<Note>& initial_notes, 
-    const std::vector<RenderNote>& render_data, 
-    double initial_bpm,
-    const std::map<std::string, std::string>& wavs,
-    const std::map<std::string, std::string>& bmps,
-    const std::string& new_title,
-    const std::string& new_artist
-)
-{
-    // 1. BMSPlayerの初期化 (ゲームロジックのコア)
+/**
+ * ユーティリティ関数: std::string の 16進数値を int に変換
+ * BMSデータ解析時に使用される可能性がある
+ */
+int hex_to_int(const std::string& hex) {
     try {
-        // BMSPlayerに、判定処理用のノーツデータと初期BPMを渡して初期化
-        player = std::make_unique<BMSPlayer>(initial_notes, initial_bpm);
-        std::cout << "BMSPlayer initialized with " << initial_notes.size() << " initial notes." << std::endl;
-        
-        // 2. メタデータとレンダリングデータの保存
-        title = new_title;
-        artist = new_artist;
-        wav_map = wavs;
-        bmp_map = bmps;
-        render_notes = render_data;
-        game_time_ms = 0.0; // 時間をリセット
-        
-        std::cout << "BMS Loaded: " << title << " by " << artist << std::endl;
-        std::cout << "Total render notes: " << render_notes.size() << std::endl;
-
-    } catch (const std::exception& e) {
-        std::cerr << "Error during BMS loading/BMSPlayer initialization: " << e.what() << std::endl;
-        player.reset(); // エラー時はプレイヤーを破棄
+        return std::stoi(hex, nullptr, 16);
     } catch (...) {
-        std::cerr << "Unknown error during BMS loading/BMSPlayer initialization." << std::endl;
-        player.reset();
+        return 0; // 変換失敗時は0を返す
     }
 }
 
-// --------------------------------------------------------
-// 時間管理 (WebAudioとの同期)
-// --------------------------------------------------------
-void BMSGameApp::SetCurrentTime(double time_ms)
-{
-    // WebAudioの現在再生時間に基づいてゲーム時間を設定
-    // これにより、ゲームの進行がオーディオ再生と厳密に同期される
-    // BMSPlayerは内部でこの時間を参照してイベントやミス処理を行う
-    game_time_ms = time_ms;
-}
+// ============================================================
+// Emscripten Binding (JavaScriptへの公開インターフェース)
+// ============================================================
 
-// --------------------------------------------------------
-// ゲームループと入力
-// --------------------------------------------------------
-void BMSGameApp::Update(double delta_time_ms)
-{
-    if (!player) return;
-
-    // BMSPlayerに現在の時間を設定し、ロジックの更新を委譲する
-    // delta_time_msは、もしSetCurrentTimeが使えない場合に備えて残すが、
-    // 主にBMSPlayerが内部で使うノーツスクロールアウト処理のトリガーとして機能する
-    try {
-        // 現在、BMSPlayer::Updateはdelta_time_msを受け取る設計なので、そのまま渡す
-        // BMSPlayerは内部でこの時間に基づいてイベント処理を行う
-        // ※ 厳密な同期のためには、SetCurrentTimeで時間を設定した後、
-        //   BMSPlayerのロジック更新（イベント処理やオートプレイ）だけを呼び出す方が良いが、
-        //   ここでは既存のUpdateメソッドを維持する
-        player->Update(delta_time_ms);
+EMSCRIPTEN_BINDINGS(BMSGameApp_bindings) {
+    // --------------------------------------------------------
+    // 構造体 (JavaScriptへ公開)
+    // --------------------------------------------------------
+    
+    // Note 構造体 (BMSPlayerのノーツデータ)
+    emscripten::value_object<Note>("Note")
+        .field("time_ms", &Note::time_ms)
+        .field("channel", &Note::channel)
+        .field("value", &Note::value);
         
-    } catch (const std::exception& e) {
-        std::cerr << "Error during BMSPlayer Update: " << e.what() << std::endl;
-    }
+    // RenderNote 構造体 (レンダリング用ノーツデータ)
+    emscripten::value_object<RenderNote>("RenderNote")
+        .field("lane", &RenderNote::lane)
+        .field("time_ms", &RenderNote::time_ms)
+        .field("duration_ms", &RenderNote::duration_ms)
+        .field("is_long_note", &RenderNote::is_long_note)
+        .field("is_ln_end", &RenderNote::is_ln_end);
+
+    // --------------------------------------------------------
+    // BMSGameApp クラス (JavaScriptへ公開)
+    // --------------------------------------------------------
+    emscripten::class_<BMSGameApp>("BMSGameApp")
+        // メソッド
+        .function("loadBMS", &BMSGameApp::LoadBMS)
+        .function("setCurrentTime", &BMSGameApp::SetCurrentTime)
+        .function("update", &BMSGameApp::Update)
+        .function("keyDown", &BMSGameApp::KeyDown)
+        .function("keyUp", &BMSGameApp::KeyUp)
+        .function("setJudgeOffset", &BMSGameApp::SetJudgeOffset)
+        .function("setAutoPlayMode", &BMSGameApp::SetAutoPlayMode)
+
+        // ゲッター (プロパティとしてアクセス可能)
+        .function("getCurrentTime", &BMSGameApp::GetCurrentTime)
+        .function("getScore", &BMSGameApp::GetScore)
+        .function("getCombo", &BMSGameApp::GetCombo)
+        .function("getTitle", &BMSGameApp::GetTitle)
+        .function("getArtist", &BMSGameApp::GetArtist)
+        .function("getRenderNotes", &BMSGameApp::GetRenderNotes)
+        .function("getWAVs", &BMSGameApp::GetWAVs)
+        .function("getBMPs", &BMSGameApp::GetBMPs)
+        .function("getCurrentBgaId", &BMSGameApp::GetCurrentBgaId)
+        .function("getCurrentLayerIds", &BMSGameApp::GetCurrentLayerIds)
+        ;
+
+    // --------------------------------------------------------
+    // グローバル関数 (JavaScriptへ公開)
+    // --------------------------------------------------------
+    emscripten::function("initializeApp", &initializeApp, emscripten::allow_raw_pointers());
+    emscripten::function("hexToInt", &hex_to_int);
 }
 
-void BMSGameApp::KeyDown(int lane_channel)
-{
-    if (!player) return;
-    std::cout << "Key Down: Lane " << lane_channel << std::endl;
-    // チャンネル11-17をBMSPlayerのJudgeに転送
-    player->Judge(lane_channel);
-}
-
-void BMSGameApp::KeyUp(int lane_channel)
-{
-    if (!player) return;
-    std::cout << "Key Up: Lane " << lane_channel << std::endl;
-    // チャンネル11-17をBMSPlayerのJudgeKeyReleaseに転送
-    player->JudgeKeyRelease(lane_channel);
-}
-
-// --------------------------------------------------------
-// 設定変更
-// --------------------------------------------------------
-void BMSGameApp::SetJudgeOffset(double offset_ms)
-{
-    if (!player) return;
-    player->SetJudgeOffset(offset_ms);
-}
-
-void BMSGameApp::SetAutoPlayMode(bool is_auto)
-{
-    if (!player) return;
-    player->SetAutoPlayMode(is_auto);
+// main関数はEmscripten環境では通常使用されないが、慣例として残す
+int main() {
+    // main関数内での処理は基本的に不要
+    return 0;
 }
